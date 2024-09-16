@@ -369,9 +369,9 @@ func setaddres(set, networkName, ipv6Address string) {
 		}
 	case "linux":
 		if set == "add" {
-			cmd = fmt.Sprintf(`ifconfig %s inet6 %s %s/128`, networkName, set, ipv6Address)
+			cmd = fmt.Sprintf(`sudo ip addr %s %s/128 dev %s;`, set, ipv6Address, networkName)
 		} else {
-			cmd = fmt.Sprintf(`ifconfig %s inet6 %s %s`, networkName, set, ipv6Address)
+			cmd = fmt.Sprintf(`sudo ip addr %s %s dev %s;`, set, ipv6Address, networkName)
 		}
 	}
 
