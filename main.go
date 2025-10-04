@@ -17,22 +17,26 @@ import (
 	"gopkg.in/ini.v1"
 )
 
-var ipv6Addresses []string
-var counter *Counter
-var osName string
+// 全局变量
+var ipv6Addresses []string // 用于存储当前可用的IPv6地址列表
+var counter *Counter       // 用于轮询选择IPv6地址的计数器
+var osName string          // 存储当前操作系统名称
 
+// Counter 是一个线程安全的计数器，用于循环获取地址
 type Counter struct {
 	mu     sync.Mutex
 	count  int
 	maxVal int
 }
 
+// NewCounter 创建一个新的计数器实例
 func NewCounter(maxVal int) *Counter {
 	return &Counter{
 		maxVal: maxVal,
 	}
 }
 
+// Increment 增加计数器的值并返回当前值，到达最大值后会归零
 func (c *Counter) Increment() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -45,25 +49,26 @@ func (c *Counter) Increment() int {
 	c.count++
 	return currentCount
 }
+
+// isFirstCharacterTwo 检查字符串的第一个字符是否为'2'，用于判断是否为公网IPv6地址
 func isFirstCharacterTwo(input string) bool {
 	if len(input) == 0 {
 		return false
 	}
-
 	firstChar := input[0]
 	return firstChar == '2'
 }
 
-// 获取所有ipv6地址
-func getIPv6Addresses(Networkname string) ([]string, error) {
+// getIPv6Addresses 获取指定网卡上所有的公网IPv6地址
+func getIPv6Addresses(networkName string) ([]string, error) {
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
 
-	var ipv6Addresses []string
+	var addresses []string
 	for _, iface := range interfaces {
-		if iface.Name == Networkname {
+		if iface.Name == networkName {
 			addrs, err := iface.Addrs()
 			if err != nil {
 				return nil, err
@@ -71,175 +76,197 @@ func getIPv6Addresses(Networkname string) ([]string, error) {
 
 			for _, addr := range addrs {
 				if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+					// 确保是IPv6地址且为公网地址
 					if ipnet.IP.To4() == nil && ipnet.IP.To16() != nil {
 						if isFirstCharacterTwo(ipnet.IP.String()) {
-							ipv6Addresses = append(ipv6Addresses, ipnet.IP.String())
+							addresses = append(addresses, ipnet.IP.String())
 						}
 					}
 				}
 			}
 		}
 	}
-
-	return ipv6Addresses, nil
+	return addresses, nil
 }
 
+// handleClient 处理单个SOCKS5客户端连接
 func handleClient(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	// 接受客户端请求
+	// 缓冲区
 	buf := make([]byte, 256)
+
+	// SOCKS5第一阶段：版本和认证方法协商
+	// +----+----------+----------+
+	// |VER | NMETHODS | METHODS  |
+	// +----+----------+----------+
+	// | 1  |    1     | 1 to 255 |
+	// +----+----------+----------+
 	_, err := clientConn.Read(buf)
 	if err != nil {
-		fmt.Println("Error reading from client:", err)
+		// 客户端可能已断开，静默处理
 		return
 	}
 
-	// 解析SOCKS请求
+	// 检查SOCKS版本是否为5
 	if buf[0] != 0x05 {
-		fmt.Println("Unsupported SOCKS version")
 		return
 	}
 
-	//numMethods := int(buf[1])
-	_, err = clientConn.Write([]byte{0x05, 0x00}) // 告诉客户端我们支持无需认证
+	// SOCKS5服务器响应：选择无需认证方法
+	// +----+--------+
+	// |VER | METHOD |
+	// +----+--------+
+	// | 1  |   1    |
+	// +----+--------+
+	_, err = clientConn.Write([]byte{0x05, 0x00}) // 0x00 表示无需认证
 	if err != nil {
-		fmt.Println("Error writing to client:", err)
 		return
 	}
 
-	// 解析连接请求
+	// SOCKS5第二阶段：接收客户端的连接请求
+	// +----+-----+-------+------+----------+----------+
+	// |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+	// +----+-----+-------+------+----------+----------+
+	// | 1  |  1  | X'00' |  1   | Variable |    2     |
+	// +----+-----+-------+------+----------+----------+
 	n, err := clientConn.Read(buf)
 	if err != nil {
-		fmt.Println("Error reading from client:", err)
 		return
 	}
 
+	// 必须是SOCKS5版本(0x05)和CONNECT命令(0x01)
 	if buf[0] != 0x05 || buf[1] != 0x01 {
-		fmt.Println("Unsupported SOCKS request")
 		return
 	}
 
+	// 解析目标地址类型(ATYP)
 	addressType := buf[3]
 	var destAddr string
 
 	switch addressType {
 	case 0x01: // IPv4地址
-		// destAddr = net.IP(buf[4:8]).String()
+		// 不支持IPv4
 		return
 	case 0x03: // 域名
-		destAddr = string(buf[5 : n-2]) // 去掉第一个字节（表示域名长度）和最后两个字节（表示端口）
-	case 0x04: // ipv6地址 没测试行不行应该问题不大
+		// 域名长度在 buf[4]
+		domainLength := int(buf[4])
+		destAddr = string(buf[5 : 5+domainLength])
+	case 0x04: // IPv6地址
 		destAddr = net.IP(buf[4:20]).String()
 	default:
-		fmt.Println("Unsupported address type")
+		// 不支持的地址类型
 		return
 	}
 
-	destPort := int(buf[n-2])<<8 + int(buf[n-1])
+	// 解析目标端口（网络字节序，大端）
+	destPort := int(buf[n-2])<<8 | int(buf[n-1])
 
-	// 建立到目标服务器的连接
-
+	// 使用指定的IPv6地址建立到目标服务器的连接
 	destConn, err := zdipfw("tcp6", fmt.Sprintf("[%s]:%d", destAddr, destPort), ipv6Addresses[counter.Increment()])
-
 	if err != nil {
-		fmt.Println("Error connecting to destination:", err)
+		// 连接目标失败
 		return
 	}
 	defer destConn.Close()
 
-	// 告诉客户端连接已建立
+	// SOCKS5服务器响应：告诉客户端连接已成功建立
+	// +----+-----+-------+------+----------+----------+
+	// |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+	// +----+-----+-------+------+----------+----------+
+	// | 1  |  1  | X'00' |  1   | Variable |    2     |
+	// +----+-----+-------+------+----------+----------+
 	_, err = clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 	if err != nil {
-		fmt.Println("Error writing to client:", err)
 		return
 	}
 
-	// 转发数据
+	// 开始双向转发数据
 	go func() {
-		_, err := io.Copy(destConn, clientConn)
-		if err != nil {
-			fmt.Println("Error copying from client to destination:", err)
-		}
+		io.Copy(destConn, clientConn)
 	}()
-
-	_, err = io.Copy(clientConn, destConn)
-	if err != nil {
-		fmt.Println("Error copying from destination to client:", err)
-	}
+	io.Copy(clientConn, destConn)
 }
+
+// zdipfw 使用指定的本地IP地址(fwip)来建立TCP连接
 func zdipfw(netw, addr string, fwip string) (net.Conn, error) {
-	//本地地址
+	// 解析本地地址，端口为0表示由系统自动选择
 	lAddr, err := net.ResolveTCPAddr(netw, "["+fwip+"]:0")
 	if err != nil {
 		return nil, err
 	}
-	//被请求的地址
+	// 解析远程目标地址
 	rAddr, err := net.ResolveTCPAddr(netw, addr)
 	if err != nil {
 		return nil, err
 	}
+	// 使用指定的本地地址拨号
 	conn, err := net.DialTCP(netw, lAddr, rAddr)
 	if err != nil {
 		return nil, err
 	}
+	// 设置35秒超时
 	deadline := time.Now().Add(35 * time.Second)
 	conn.SetDeadline(deadline)
 	return conn, nil
 }
 
+// main 程序主入口
 func main() {
 	osName = runtime.GOOS
 
-	// 判断操作系统类型
 	switch osName {
 	case "windows":
-		fmt.Println("System is Windows")
+		fmt.Println("检测到系统: Windows")
 	case "linux":
-		fmt.Println("System is Linux")
+		fmt.Println("检测到系统: Linux")
 	default:
-		errhandling(fmt.Errorf("unknown system"))
+		errhandling(fmt.Errorf("未知的操作系统"))
 	}
-	// 加载INI配置文件
 
+	// 加载INI配置文件
 	cfg, err := ini.Load("config.ini")
 	if err != nil {
 		errhandling(err)
 	}
 
-	// 获取Networkname字段
+	// 读取配置项
 	section := cfg.Section("")
 	networkName := section.Key("Networkname").String()
 	port := section.Key("port").String()
 	if networkName == "" || port == "" {
 		fmt.Println("NetworkName:" + networkName)
 		fmt.Println("Port:" + port)
-		errhandling(fmt.Errorf("check config.ini"))
+		errhandling(fmt.Errorf("请检查 config.ini 配置文件"))
 	}
-	fmt.Println("Networkname:", networkName)
-	//获取前缀长度为64的公网地址
+	fmt.Println("使用的网卡名称:", networkName)
+
+	// 获取所有前缀为/64的IPv6地址的完整IP
 	ya, err := get64(networkName)
 	if err != nil {
 		errhandling(err)
 	}
-	// 获取当前的ipv6地址
+
+	// 获取当前所有的IPv6地址
 	ipv6Addresses, _ = getIPv6Addresses(networkName)
-	maxVal := len(ipv6Addresses)
-	counter = NewCounter(maxVal)
-	// 删除除了ya之外的ipv6地址
-	p := promptForYesNo("Remove addresses other than 64 prefix(!!!)")
+
+	// 提示用户是否要删除除/64地址之外的其他地址
+	p := promptForYesNo("是否删除除/64地址以外的IPv6地址(!!!)")
 	if p {
-		fmt.Println("Removing")
+		fmt.Println("开始删除地址...")
 		processIPv6Addresses(ipv6Addresses, networkName, ya)
-		fmt.Println("Remove completed")
+		fmt.Println("删除完成")
 	}
-	p = promptForYesNo("Add ipv6 address")
+
+	// 提示用户是否要添加新的IPv6地址
+	p = promptForYesNo("是否要添加新的IPv6地址")
 	if p {
-		//生成地址
 		var userInput int
-		fmt.Print("Add quantity:")
+		fmt.Print("请输入添加数量: ")
 		fmt.Scanf("%d", &userInput)
-		fmt.Println("Adding")
+
+		fmt.Println("开始添加地址...")
+		// 基于/64地址的前缀生成随机地址
 		na := generateRandomIPv6Batch(ya[0], userInput)
 		progress := pb.StartNew(len(na))
 		for c := 0; c < len(na); c++ {
@@ -247,118 +274,110 @@ func main() {
 			progress.Increment()
 		}
 		progress.Finish()
-		fmt.Println("Add completed")
+		fmt.Println("添加完成")
 	}
 
-	//获取当前地址
+	// 重新获取最新的地址列表并初始化计数器
 	ipv6Addresses, _ = getIPv6Addresses(networkName)
-	maxVal = len(ipv6Addresses)
+	maxVal := len(ipv6Addresses)
 	counter = NewCounter(maxVal)
-	fmt.Printf("You have %d IPv6 addresses.\n", len(ipv6Addresses))
+	fmt.Printf("当前共有 %d 个可用的IPv6地址。\n", len(ipv6Addresses))
 
+	// 启动SOCKS5代理服务器
 	listenAddr := "0.0.0.0:" + port
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		fmt.Println("Error starting proxy:", err)
+		fmt.Println("启动代理失败:", err)
 		os.Exit(1)
 	}
 	defer listener.Close()
 
-	fmt.Printf("SOCKS proxy is listening on %s...\n", listenAddr)
+	fmt.Printf("SOCKS5 代理正在监听 %s...\n", listenAddr)
 
+	// 循环接受客户端连接
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("Error accepting client connection:", err)
+			fmt.Println("接受客户端连接失败:", err)
 			continue
 		}
 		go handleClient(clientConn)
 	}
 }
+
+// promptForYesNo 向用户提问并获取y/n的答复
 func promptForYesNo(prompt string) bool {
 	reader := bufio.NewReader(os.Stdin)
-
 	for {
 		fmt.Print(prompt + " (y/n): ")
 		input, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Println("Error reading input:", err)
+			fmt.Println("读取输入错误:", err)
 			return false
 		}
-
-		// 清除输入中的空白字符
 		input = strings.TrimSpace(input)
 
-		// 判断输入是否为y或n，不区分大小写
 		if strings.EqualFold(input, "y") {
 			return true
 		} else if strings.EqualFold(input, "n") {
 			return false
 		}
-
-		fmt.Println("Please enter only 'y' or 'n'")
+		fmt.Println("请输入 'y' 或 'n'")
 	}
 }
-func get64(Networkname string) ([]string, error) {
-	// 获取指定网络接口
-	iface, err := net.InterfaceByName(Networkname)
+
+// get64 扫描并返回所有后缀为/64的IPv6地址的完整IP部分
+func get64(networkName string) ([]string, error) {
+	iface, err := net.InterfaceByName(networkName)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to obtain network interface:" + err.Error())
+		return nil, fmt.Errorf("获取网卡失败: " + err.Error())
 	}
 
-	// 获取接口的地址信息
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to obtain address information:" + err.Error())
+		return nil, fmt.Errorf("获取地址信息失败: " + err.Error())
 	}
 
-	// 遍历每个地址
 	var r []string
 	for _, addr := range addrs {
-
 		addrStr := addr.String()
-		// 检查地址字符串中的前缀长度是否为64
 		if isFirstCharacterTwo(addrStr) {
-			fmt.Println("IPv6 地址:", addr)
+			fmt.Println("发现IPv6 地址:", addr)
 			if strings.HasSuffix(addrStr, "/64") {
-				r = append(r, strings.TrimSuffix(addrStr, "/64"))
+				// 去除/64后缀，保留完整的IP地址字符串
+				fullIP := strings.TrimSuffix(addrStr, "/64")
+				r = append(r, fullIP)
 			}
 		}
-
 	}
 	if len(r) > 0 {
 		return r, nil
 	} else {
-		return nil, fmt.Errorf("no have 64 prefix ipv6 address")
+		return nil, fmt.Errorf("错误：未找到任何前缀为/64的IPv6地址")
 	}
-
 }
 
-// 运行cmd命令
+// runCmd 根据操作系统执行shell命令
 func runCmd(command string) error {
+	var cmd *exec.Cmd
 	switch osName {
 	case "windows":
-		cmd := exec.Command("cmd", "/c", command)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed to run command: %v\noutput: %s", err, output)
-		}
-		return nil
+		cmd = exec.Command("cmd", "/c", command)
 	case "linux":
-		// 使用Command函数创建Cmd结构体
-		command := exec.Command("bash", "-c", command)
+		cmd = exec.Command("bash", "-c", command)
+	default:
+		return fmt.Errorf("不支持的操作系统")
+	}
 
-		// 执行命令并获取输出
-		output, err := command.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed to run command: %v\noutput: %s", err, output)
-		}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("命令执行失败: %v\n输出: %s", err, output)
 	}
 	return nil
 }
 
+// setaddres 添加或删除IPv6地址
 func setaddres(set, networkName, ipv6Address string) {
-	// 构建netsh命令
 	var cmd string
 	switch osName {
 	case "windows":
@@ -369,74 +388,82 @@ func setaddres(set, networkName, ipv6Address string) {
 		}
 	case "linux":
 		if set == "add" {
-			cmd = fmt.Sprintf(`sudo ip addr %s %s/128 dev %s;`, set, ipv6Address, networkName)
+			// 在Linux上添加的地址默认就是/128
+			cmd = fmt.Sprintf(`sudo ip addr %s %s/128 dev %s`, set, ipv6Address, networkName)
 		} else {
-			cmd = fmt.Sprintf(`sudo ip addr %s %s dev %s;`, set, ipv6Address, networkName)
+			// 删除时需要指定完整的地址和前缀
+			cmd = fmt.Sprintf(`sudo ip addr %s %s/128 dev %s`, set, ipv6Address, networkName)
 		}
 	}
 
-	// 运行命令
 	err := runCmd(cmd)
 	if err != nil {
-		fmt.Println("Failed to run command:", err)
+		// 打印错误，但不中断程序
+		fmt.Println("命令执行失败:", err)
 		return
 	}
 }
 
-// 处理IPv6地址切片
-func processIPv6Addresses(ipv6Addresses []string, Networkname string, ya []string) {
-	// 遍历IPv6地址切片
+// processIPv6Addresses 处理地址列表，删除不在保留列表(ya)中的地址
+func processIPv6Addresses(ipv6Addresses []string, networkName string, ya []string) {
 	progress := pb.StartNew(len(ipv6Addresses))
 	for _, address := range ipv6Addresses {
-		// 检查是否包含在ya切片中
 		found := false
-		for _, prefix := range ya {
-			if strings.Contains(address, prefix) {
+		// 遍历要保留的IP列表
+		for _, ipToKeep := range ya {
+			// 进行精确的完全匹配
+			if address == ipToKeep {
 				found = true
 				break
 			}
 		}
-		// 如果包含在ya切片中，则跳过
+		// 如果地址在保留列表中，则跳过
 		if found {
 			progress.Increment()
 			continue
 		}
 
-		// 否则，执行操作
-		setaddres("del", Networkname, address)
+		// 否则，执行删除操作
+		setaddres("del", networkName, address)
 		progress.Increment()
 	}
 	progress.Finish()
 }
 
-// 生成具有相同64位前缀的随机IPv6地址
+// generateRandomIPv6Batch 基于一个完整的IPv6地址，生成多个具有相同/64前缀的随机地址
 func generateRandomIPv6Batch(baseIPv6 string, count int) []string {
 	// 解析基础IPv6地址
 	baseIP := net.ParseIP(baseIPv6)
 	if baseIP == nil {
+		fmt.Println("错误：无法解析基础IPv6地址用于生成随机地址")
 		return nil
 	}
 
-	// 获取前64位前缀
+	// 获取前64位前缀（即IP地址的前8个字节）
 	prefix := baseIP[:8]
 
-	// 生成随机的后64位
 	randomIPv6Addresses := make([]string, count)
-
 	for i := 0; i < count; i++ {
+		// 生成随机的后64位（即8个字节）
 		randomSuffix := make([]byte, 8)
-		rand.Read(randomSuffix)
+		_, err := rand.Read(randomSuffix)
+		if err != nil {
+			fmt.Println("错误：生成随机后缀失败")
+			continue
+		}
 
-		// 合并前64位前缀和随机的后64位
+		// 合并前缀和随机后缀，组成新的IPv6地址
 		randomIPv6 := net.IP(append(prefix, randomSuffix...)).String()
 		randomIPv6Addresses[i] = randomIPv6
 	}
 
 	return randomIPv6Addresses
 }
+
+// errhandling 统一的错误处理函数，打印错误并等待用户按键退出
 func errhandling(err error) {
-	fmt.Println(err.Error())
-	fmt.Printf("Press any key to exit...")
+	fmt.Println("发生错误:", err.Error())
+	fmt.Printf("按任意键退出...")
 	b := make([]byte, 1)
 	os.Stdin.Read(b)
 	os.Exit(1)
